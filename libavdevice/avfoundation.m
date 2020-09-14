@@ -122,6 +122,8 @@ typedef struct
 
     int32_t         *audio_buffer;
     int             audio_buffer_size;
+    int             audio_data_size;
+    int64_t         audio_data_pts;
 
     enum AVPixelFormat pixel_format;
 
@@ -137,6 +139,8 @@ typedef struct
 #endif
     int                      observed_quit;
 } AVFContext;
+
+static int read_audio_data_from_device(AVFContext* ctx);
 
 static void lock_frames(AVFContext* ctx)
 {
@@ -277,6 +281,7 @@ static void unlock_frames(AVFContext* ctx)
 
     _context->current_audio_frame = (CMSampleBufferRef)CFRetain(audioFrame);
 
+    read_audio_data_from_device(_context);
     unlock_frames(_context);
 
     ++_context->audio_frames_captured;
@@ -371,7 +376,7 @@ static int configure_video_device(AVFormatContext *s, AVCaptureDevice *video_dev
             }
         }
 
-        if (!selected_format) {
+         if (!selected_format) {
             av_log(s, AV_LOG_ERROR, "Selected video size (%dx%d) is not supported by the device.\n",
                 ctx->width, ctx->height);
             goto unsupported_format;
@@ -599,7 +604,9 @@ static int add_audio_device(AVFormatContext *s, AVCaptureDevice *audio_device)
 
     // Attaching output
     ctx->audio_output = [[AVCaptureAudioDataOutput alloc] init];
-
+    ctx->audio_data_size = 0;
+    ctx->audio_data_pts = 0;
+    
     if (!ctx->audio_output) {
         av_log(s, AV_LOG_ERROR, "Failed to init AV audio output\n");
         return 1;
@@ -738,7 +745,7 @@ static int get_audio_config(AVFormatContext *s)
 
     if (ctx->audio_non_interleaved) {
         CMBlockBufferRef block_buffer = CMSampleBufferGetDataBuffer(ctx->current_audio_frame);
-        ctx->audio_buffer_size        = CMBlockBufferGetDataLength(block_buffer);
+        ctx->audio_buffer_size        = CMBlockBufferGetDataLength(block_buffer) * 256;
         ctx->audio_buffer             = av_malloc(ctx->audio_buffer_size);
         if (!ctx->audio_buffer) {
             av_log(s, AV_LOG_ERROR, "error allocating audio buffer\n");
@@ -1046,6 +1053,43 @@ static int copy_cvpixelbuffer(AVFormatContext *s,
     return status;
 }
 
+static int read_audio_data_from_device(AVFContext* ctx)
+{
+    if(ctx->audio_buffer != NULL && ctx->audio_data_size < ctx->audio_buffer_size)
+    {
+        CMBlockBufferRef block_buffer = CMSampleBufferGetDataBuffer(ctx->current_audio_frame);
+        int block_buffer_size         = CMBlockBufferGetDataLength(block_buffer);
+        if (!block_buffer || !block_buffer_size) {
+            return AVERROR(EIO);
+        }
+
+        if (ctx->audio_non_interleaved && block_buffer_size + ctx->audio_data_size > ctx->audio_buffer_size) {
+            return AVERROR_BUFFER_TOO_SMALL;
+        }
+
+        if(ctx->audio_data_size == 0){
+            CMItemCount count;
+            CMSampleTimingInfo timing_info;
+
+            if (CMSampleBufferGetOutputSampleTimingInfoArray(ctx->current_audio_frame, 1, &timing_info, &count) == noErr) {
+                AVRational timebase_q = av_make_q(1, timing_info.presentationTimeStamp.timescale);
+                ctx->audio_data_pts = av_rescale_q(timing_info.presentationTimeStamp.value, timebase_q, avf_time_base_q);
+            }
+        }
+
+        OSStatus ret = CMBlockBufferCopyDataBytes(block_buffer, 0, block_buffer_size, (void *)((char *)ctx->audio_buffer + ctx->audio_data_size));
+        if (ret != kCMBlockBufferNoErr) {
+            return AVERROR(EIO);
+        }
+
+        ctx->audio_data_size += block_buffer_size;
+
+        CFRelease(ctx->current_audio_frame);
+        ctx->current_audio_frame = nil;
+    }
+    return 0;
+}
+
 static int avf_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     AVFContext* ctx = (AVFContext*)s->priv_data;
@@ -1099,40 +1143,18 @@ static int avf_read_packet(AVFormatContext *s, AVPacket *pkt)
 
             if (status < 0)
                 return status;
-        } else if (ctx->current_audio_frame != nil) {
-            CMBlockBufferRef block_buffer = CMSampleBufferGetDataBuffer(ctx->current_audio_frame);
-            int block_buffer_size         = CMBlockBufferGetDataLength(block_buffer);
-
-            if (!block_buffer || !block_buffer_size) {
+        } else if (ctx->audio_data_size != 0) {
+            if (av_new_packet(pkt, ctx->audio_data_size) < 0) {
                 return AVERROR(EIO);
             }
 
-            if (ctx->audio_non_interleaved && block_buffer_size > ctx->audio_buffer_size) {
-                return AVERROR_BUFFER_TOO_SMALL;
-            }
-
-            if (av_new_packet(pkt, block_buffer_size) < 0) {
-                return AVERROR(EIO);
-            }
-
-            CMItemCount count;
-            CMSampleTimingInfo timing_info;
-
-            if (CMSampleBufferGetOutputSampleTimingInfoArray(ctx->current_audio_frame, 1, &timing_info, &count) == noErr) {
-                AVRational timebase_q = av_make_q(1, timing_info.presentationTimeStamp.timescale);
-                pkt->pts = pkt->dts = av_rescale_q(timing_info.presentationTimeStamp.value, timebase_q, avf_time_base_q);
-            }
+            pkt->pts = pkt->dts = ctx->audio_data_pts;
 
             pkt->stream_index  = ctx->audio_stream_index;
             pkt->flags        |= AV_PKT_FLAG_KEY;
 
             if (ctx->audio_non_interleaved) {
                 int sample, c, shift, num_samples;
-
-                OSStatus ret = CMBlockBufferCopyDataBytes(block_buffer, 0, pkt->size, ctx->audio_buffer);
-                if (ret != kCMBlockBufferNoErr) {
-                    return AVERROR(EIO);
-                }
 
                 num_samples = pkt->size / (ctx->audio_channels * (ctx->audio_bits_per_sample >> 3));
 
@@ -1166,8 +1188,7 @@ static int avf_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
             }
 
-            CFRelease(ctx->current_audio_frame);
-            ctx->current_audio_frame = nil;
+            ctx->audio_data_size = 0;
         } else {
             pkt->data = NULL;
             unlock_frames(ctx);
